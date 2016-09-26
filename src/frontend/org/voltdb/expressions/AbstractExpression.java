@@ -1316,8 +1316,10 @@ public abstract class AbstractExpression implements JSONString, Cloneable {
         return findAllSubexpressionsOfClass(ParameterValueExpression.class);
     }
 
-    public List<AbstractExpression> findAllTupleValueSubexpressions() {
-        return findAllSubexpressionsOfClass(TupleValueExpression.class);
+    public List<TupleValueExpression> findAllTupleValueSubexpressions() {
+        ArrayList<TupleValueExpression> collected = new ArrayList<>();
+        findAllSubexpressionsOfClass_recurse(TupleValueExpression.class, collected);
+        return collected;
     }
 
     /**
@@ -1471,4 +1473,27 @@ public abstract class AbstractExpression implements JSONString, Cloneable {
         }
         stringer.endArray();
     }
+
+    public boolean isColumnEquivalenceFilter() {
+        // Ignore expressions that are not of COMPARE_EQUAL or
+        // COMPARE_NOTDISTINCT type
+        ExpressionType type = getExpressionType();
+        if (type != ExpressionType.COMPARE_EQUAL &&
+                type != ExpressionType.COMPARE_NOTDISTINCT) {
+            return false;
+        }
+        AbstractExpression leftExpr = getLeft();
+        // Can't use an expression that is based on a column value but is not just a simple column value.
+        if ( ( ! (leftExpr instanceof TupleValueExpression)) &&
+                leftExpr.hasAnySubexpressionOfClass(TupleValueExpression.class) ) {
+            return false;
+        }
+        AbstractExpression rightExpr = getRight();
+        if ( ( ! (rightExpr instanceof TupleValueExpression)) &&
+                rightExpr.hasAnySubexpressionOfClass(TupleValueExpression.class) ) {
+            return false;
+        }
+        return true;
+    }
+
 }
