@@ -30,9 +30,11 @@ import java.io.PrintWriter;
 import java.net.URL;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.EmptyStackException;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Stack;
 
 import junit.framework.TestCase;
 
@@ -43,7 +45,11 @@ import org.voltdb.compiler.DeterminismMode;
 import org.voltdb.expressions.AbstractExpression;
 import org.voltdb.expressions.TupleValueExpression;
 import org.voltdb.plannodes.AbstractPlanNode;
+import org.voltdb.plannodes.NestLoopPlanNode;
 import org.voltdb.plannodes.OrderByPlanNode;
+import org.voltdb.plannodes.SeqScanPlanNode;
+import org.voltdb.types.ExpressionType;
+import org.voltdb.types.JoinType;
 import org.voltdb.types.PlanNodeType;
 import org.voltdb.types.SortDirectionType;
 
@@ -221,6 +227,18 @@ public class PlannerTestCase extends TestCase {
         return compileSPWithJoinOrder(sql, paramCount, joinOrder);
     }
 
+    /** A bare-bones planner test for the basic structure of a plan */
+    protected AbstractPlanNode compileToTopDownTree(String sql,
+            int nOutputColumns, PlanNodeType... nodeTypes) {
+        // Yes, we ARE assuming that test queries don't
+        // contain quoted question marks.
+        int paramCount = StringUtils.countMatches(sql, "?");
+        AbstractPlanNode result = compileSPWithJoinOrder(sql, paramCount, null);
+        assertEquals(nOutputColumns, result.getOutputSchema().size());
+        assertTopDownTree(result, nodeTypes);
+        return result;
+    }
+
     /** A helper here where the junit test can assert success */
     protected AbstractPlanNode compile(String sql) {
         // Yes, we ARE assuming that test queries don't contain quoted question marks.
@@ -346,24 +364,21 @@ public class PlannerTestCase extends TestCase {
             assertTrue(expr instanceof TupleValueExpression);
             TupleValueExpression tve = (TupleValueExpression)expr;
             String expectedNames[] = ((String)columnDescrs[2*idx]).split("\\.");
-            String tableName = null;
             String columnName = null;
-            if (expectedNames.length == 2) {
-                tableName = expectedNames[0].toUpperCase();
-                columnName = expectedNames[1].toUpperCase();
-            } else {
-                columnName = expectedNames[0].toUpperCase();
-            }
-            assertEquals(columnName, tve.getColumnName().toUpperCase());
-            if (tableName != null) {
+            int nNames = expectedNames.length;
+            if (nNames > 1) {
+                assertEquals(2, nNames);
+                String tableName = expectedNames[0].toUpperCase();
                 assertEquals(tableName, tve.getTableName().toUpperCase());
             }
-            assertEquals(columnDescrs[2*idx+1],       dir);
+            columnName = expectedNames[nNames-1].toUpperCase();
+            assertEquals(columnName, tve.getColumnName().toUpperCase());
+            assertEquals(columnDescrs[2*idx+1], dir);
         }
     }
 
     /** Given a list of Class objects for plan node subclasses, asserts
-     * if the given plan doesn't contain instances of those classes.
+     * that the given plan contains instances of those classes.
      */
     static protected void assertClassesMatchNodeChain(
             List<Class<? extends AbstractPlanNode>> expectedClasses,
@@ -375,10 +390,12 @@ public class PlannerTestCase extends TestCase {
             assertTrue("Expected plan to contain an instance of " + c.getSimpleName() +", "
                     + "instead found " + pn.getClass().getSimpleName(),
                     c.isInstance(pn));
-            if (pn.getChildCount() > 0)
+            if (pn.getChildCount() > 0) {
                 pn = pn.getChild(0);
-            else
+            }
+            else {
                 pn = null;
+            }
         }
 
         assertTrue("Actual plan longer than expected", pn == null);
@@ -822,4 +839,148 @@ public class PlannerTestCase extends TestCase {
         }
         writeFile(new File(String.format("tests/ee/%s/%s.cpp", testFolder, testClassName)), template);
     }
+
+    protected static AbstractPlanNode followAssertedLeftChain(
+            AbstractPlanNode start,
+            PlanNodeType startType, PlanNodeType... nodeTypes) {
+        AbstractPlanNode result = start;
+        assertEquals(startType, result.getPlanNodeType());
+        for (PlanNodeType type : nodeTypes) {
+            assertTrue(result.getChildCount() > 0);
+            result = result.getChild(0);
+            assertEquals(type, result.getPlanNodeType());
+        }
+        return result;
+    }
+
+    protected static void assertLeftChain(
+            AbstractPlanNode start, PlanNodeType... nodeTypes) {
+        AbstractPlanNode pn = start;
+        for (PlanNodeType type : nodeTypes) {
+            assertFalse("Child node(s) are missing from the actual plan chain.",
+                    pn == null);
+            if ( ! type.equals(pn.getPlanNodeType())) {
+                fail("Expecting plan node of type " + type + ", " +
+                        "instead found " + pn.getPlanNodeType() + ".");
+            }
+            pn = (pn.getChildCount() > 0) ? pn.getChild(0) : null;
+        }
+        assertTrue("Actual plan chain was shorter than expected",
+                pn == null);
+    }
+
+    protected static void assertProjectingCoordinator(
+            List<AbstractPlanNode> lpn) {
+        AbstractPlanNode pn;
+        pn = lpn.get(0);
+        assertTopDownTree(pn, PlanNodeType.SEND,
+                PlanNodeType.PROJECTION,
+                PlanNodeType.RECEIVE);
+    }
+
+    protected static void assertReplicatedLeftJoinCoordinator(
+            List<AbstractPlanNode> lpn, String replicatedTable) {
+        AbstractPlanNode pn;
+        AbstractPlanNode node;
+        NestLoopPlanNode nlj;
+        SeqScanPlanNode seqScan;
+        pn = lpn.get(0);
+        assertTopDownTree(pn, PlanNodeType.SEND,
+                PlanNodeType.PROJECTION,
+                PlanNodeType.NESTLOOP,
+                PlanNodeType.SEQSCAN,
+                PlanNodeType.RECEIVE);
+        node = followAssertedLeftChain(pn, PlanNodeType.SEND,
+                PlanNodeType.PROJECTION,
+                PlanNodeType.NESTLOOP);
+        nlj = (NestLoopPlanNode) node;
+        assertEquals(JoinType.LEFT, nlj.getJoinType());
+        assertEquals(2, nlj.getChildCount());
+        seqScan = (SeqScanPlanNode) nlj.getChild(0);
+        assertEquals(replicatedTable, seqScan.getTargetTableName().toUpperCase());
+    }
+
+    protected static void assertExprTopDownTree(AbstractExpression start,
+            ExpressionType... exprTypes) {
+        assertNotNull(start);
+        Stack<AbstractExpression> stack = new Stack<>();
+        stack.push(start);
+        for (ExpressionType type : exprTypes) {
+            // Process each node before its children or later siblings.
+            AbstractExpression parent;
+            try {
+                parent = stack.pop();
+            }
+            catch (EmptyStackException ese) {
+                fail("No expression was found in the tree to match type " + type);
+                return; // This dead code hushes warnings.
+            }
+            List<AbstractExpression> args = parent.getArgs();
+            AbstractExpression rightExpr = parent.getRight();
+            AbstractExpression leftExpr = parent.getLeft();
+            int argCount = (args == null) ? 0 : args.size();
+            int childCount = argCount +
+                    (rightExpr == null ? 0 : 1) +
+                    (leftExpr == null ? 0 : 1);
+            if (type == null) {
+                // A null type wildcard matches any child TREE or NODE.
+                System.out.println("DEBUG: Suggestion -- expect " +
+                        parent.getExpressionType() +
+                        " with " + childCount + " direct children.");
+                continue;
+            }
+            assertEquals(type, parent.getExpressionType());
+            // Iterate from the last child to the first.
+            while (argCount > 0) {
+                // Push each child to be processed before its parent's
+                // or its own later (already pushed) siblings.
+                stack.push(parent.getArgs().get(--argCount));
+            }
+            if (rightExpr != null) {
+                stack.push(rightExpr);
+            }
+            if (leftExpr != null) {
+                stack.push(leftExpr);
+            }
+        }
+        assertTrue("Extra node(s) (" + stack.size() +
+                ") were found in the tree with no node type to match",
+                stack.isEmpty());
+    }
+
+    protected static void assertTopDownTree(AbstractPlanNode start,
+            PlanNodeType... nodeTypes) {
+        Stack<AbstractPlanNode> stack = new Stack<>();
+        stack.push(start);
+        for (PlanNodeType type : nodeTypes) {
+            // Process each node before its children or later siblings.
+            AbstractPlanNode parent;
+            try {
+                parent = stack.pop();
+            }
+            catch (EmptyStackException ese) {
+                fail("No node was found in the tree to match node type " + type);
+                return; // This dead code hushes warnings.
+            }
+            int childCount = parent.getChildCount();
+            if (type == null) {
+                // A null type wildcard matches any child TREE or NODE.
+                System.out.println("DEBUG: Suggestion -- expect " +
+                        parent.getPlanNodeType() +
+                        " with " + childCount + " direct children.");
+                continue;
+            }
+            assertEquals(type, parent.getPlanNodeType());
+            // Iterate from the last child to the first.
+            while (childCount > 0) {
+                // Push each child to be processed before its parent's
+                // or its own later (already pushed) siblings.
+                stack.push(parent.getChild(--childCount));
+            }
+        }
+        assertTrue("Extra node(s) (" + stack.size() +
+                ") were found in the tree with no node type to match",
+                stack.isEmpty());
+    }
+
 }
