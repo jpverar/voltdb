@@ -21,9 +21,41 @@ import java.util.ArrayList;
 import java.util.Iterator;
 
 public class DRRoleStats extends StatsSource {
-    public DRRoleStats(ProducerDRGateway producer, ConsumerDRGateway consumer)
+    // This will be replaced by the deployment file role once ENG-11457 and ENG-11459
+    private enum Role {
+        NONE, MASTER, REPLICA, XDCR
+    }
+
+    public enum State {
+        DISABLED, // Feature is completely disabled
+        ACTIVE,   // Actively exchanging data with remote cluster
+        PENDING,  // Waiting to establish connection with remote cluster
+        STOPPED;  // Replication broken due to error
+
+        /**
+         * Almost like logically ANDing two states together. The precedence is
+         * STOPPED->PENDING->ACTIVE->DISABLED. This happened to be the reverse
+         * ordinal order.
+         *
+         * @param other The other state
+         * @return The combined state
+         */
+        public State and(State other)
+        {
+            if (other.ordinal() > this.ordinal()) {
+                return other;
+            } else {
+                return this;
+            }
+        }
+    }
+
+    private final VoltDBInterface m_vdb;
+
+    public DRRoleStats(VoltDBInterface vdb)
     {
         super(false);
+        m_vdb = vdb;
     }
 
     @Override
@@ -38,9 +70,34 @@ public class DRRoleStats extends StatsSource {
     @Override
     protected void updateStatsRow(Object rowKey, Object[] rowValues)
     {
-        rowValues[columnNameToIndex.get("ROLE")] = "NONE";
-        rowValues[columnNameToIndex.get("STATE")] = "DISABLED";
-        rowValues[columnNameToIndex.get("REMOTE_CLUSTER_ID")] = -1;
+        final ProducerDRGateway producer = m_vdb.getNodeDRGateway();
+        final DRProducerNodeStats producerStats;
+        if (producer != null) {
+            producerStats = producer.getNodeDRStats();
+        } else {
+            producerStats = null;
+        }
+
+        final Role role = getRole(producerStats);
+        State state = State.DISABLED;
+
+        if (role == Role.XDCR || role == Role.MASTER) {
+            if (producerStats != null) {
+                state = state.and(producerStats.state);
+            }
+        }
+
+        if (role == Role.XDCR || role == Role.REPLICA) {
+            final ConsumerDRGateway consumer = m_vdb.getConsumerDRGateway();
+            if (consumer != null) {
+                state = state.and(consumer.getState());
+            }
+        }
+
+        rowValues[columnNameToIndex.get("ROLE")] = role.name();
+        rowValues[columnNameToIndex.get("STATE")] = state.name();
+        rowValues[columnNameToIndex.get("REMOTE_CLUSTER_ID")] = -1; // reserved for multi-cluster XDCR
+
         super.updateStatsRow(rowKey, rowValues);
     }
 
@@ -67,5 +124,20 @@ public class DRRoleStats extends StatsSource {
                 }
             }
         };
+    }
+
+    private Role getRole(DRProducerNodeStats producerStats)
+    {
+        if (m_vdb.getReplicationRole() == ReplicationRole.REPLICA) {
+            return Role.REPLICA;
+        } else if (producerStats != null && producerStats.state != State.DISABLED) {
+            if (m_vdb.getConsumerDRGateway() == null) {
+                return Role.MASTER;
+            } else {
+                return Role.XDCR;
+            }
+        } else {
+            return Role.NONE;
+        }
     }
 }
